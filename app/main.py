@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -45,6 +45,11 @@ def fmt_time(ms: int) -> str:
     mnt, ms = divmod(ms, 60_000)
     sec, ms = divmod(ms, 1000)
     return f"{sign}{h:02d}:{mnt:02d}:{sec:02d},{ms:03d}"
+
+
+def fmt_time_vtt(ms: int) -> str:
+    """毫秒格式化为 WebVTT 时间（HH:MM:SS.mmm）。"""
+    return fmt_time(ms).replace(",", ".")
 
 
 # ---------------------------------------------------------------- SRT 解析
@@ -1846,4 +1851,237 @@ def wordmark_export(req: WordMarkRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="word_mark_intervals.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 字幕遮挡避让
+
+class OcclusionInterval(BaseModel):
+    start: str  # 遮挡区间起点 HH:MM:SS,mmm
+    end: str    # 遮挡区间终点 HH:MM:SS,mmm
+    side: str   # 遮挡侧：top（上方）/ bottom（下方）
+
+
+class PositionRequest(BaseModel):
+    srt: str
+    intervals: List[OcclusionInterval]
+
+
+_SIDE_ALIASES = {
+    "top": "top", "上": "top", "上方": "top",
+    "bottom": "bottom", "下": "bottom", "下方": "bottom",
+}
+
+
+def validate_occlusions(raw: List["OcclusionInterval"]) -> List[dict]:
+    """校验遮挡区间，返回 [{start, end, side, row}]（row 为输入行号，1 起）。
+
+    起点须严格早于终点；同侧区间允许相互重叠，故不做重叠检查。
+    起止均空的行视为未填写而跳过（与前端行过滤一致）。
+    """
+    rows = [r for r in raw if r.start.strip() or r.end.strip()]
+    parsed = []
+    for i, r in enumerate(rows, 1):
+        side = _SIDE_ALIASES.get((r.side or "").strip().lower())
+        if side is None:
+            raise ValueError(f"遮挡区间 {i}：遮挡侧须为 top（上方）或 bottom（下方）")
+        try:
+            s, e = parse_time(r.start), parse_time(r.end)
+        except ValueError as ex:
+            raise ValueError(f"遮挡区间 {i}：{ex}")
+        if s >= e:
+            raise ValueError(
+                f"遮挡区间 {i}：起点 {fmt_time(s)} 须早于终点 {fmt_time(e)}"
+            )
+        parsed.append({"start": s, "end": e, "side": side, "row": i})
+    return parsed
+
+
+def plan_positions(entries: List[dict], occlusions: List[dict]):
+    """逐条选择字幕放置侧（上方 / 下方）的全局规划。
+
+    每条字幕与每个遮挡区间按左闭右开求正时长交叠：与上方区间交叠则上方
+    不可放置，与下方区间交叠则下方不可放置；两侧均不可放置即为冲突。
+
+    无冲突时用动态规划逐条选侧，三级目标依次：
+      1) 相邻字幕换位（所选侧不同）次数最少；
+      2) 位于下方的条数最多；
+      3) 仍并列时按「下方优先」的位置序列取舍：两条并列序列在首个不同
+         位置处，取该位置为下方者。
+
+    返回 (placement, conflicts)。placement[i] = {"side", "allow_top",
+    "allow_bottom", "switches"（截至第 i 条的累计换位次数）}；
+    存在冲突时 placement 为 None，conflicts 逐条给出原序号与冲突区间。
+    """
+    n = len(entries)
+    allow_top = [True] * n
+    allow_bottom = [True] * n
+    blockers = [[] for _ in range(n)]  # 与每条字幕正时长交叠的遮挡区间
+    for i, e in enumerate(entries):
+        for oc in occlusions:
+            lo = e["start"] if e["start"] > oc["start"] else oc["start"]
+            hi = e["end"] if e["end"] < oc["end"] else oc["end"]
+            if lo < hi:  # 左闭右开：端点相触不算交叠
+                if oc["side"] == "top":
+                    allow_top[i] = False
+                else:
+                    allow_bottom[i] = False
+                blockers[i].append(oc)
+
+    conflicts = []
+    for i in range(n):
+        if not allow_top[i] and not allow_bottom[i]:
+            conflicts.append({
+                "seq": i + 1,
+                "index": entries[i]["index"],
+                "time": f"{fmt_time(entries[i]['start'])} --> {fmt_time(entries[i]['end'])}",
+                "intervals": [
+                    {
+                        "row": oc["row"],
+                        "side": oc["side"],
+                        "start": fmt_time(oc["start"]),
+                        "end": fmt_time(oc["end"]),
+                    }
+                    for oc in blockers[i]
+                ],
+            })
+    if conflicts:
+        return None, conflicts
+
+    # 后缀 DP：g[i][s] 为第 i 条放在 s 侧时，第 i..n-1 条的最优
+    # (换位次数, 下方条数取负)；换位只统计第 i 条之后的相邻对，
+    # 下方条数含第 i 条自身。BOTTOM < TOP 使并列时下方优先。
+    BOTTOM, TOP = 0, 1
+    allowed = []
+    for i in range(n):
+        sides = []
+        if allow_bottom[i]:
+            sides.append(BOTTOM)
+        if allow_top[i]:
+            sides.append(TOP)
+        allowed.append(sides)
+
+    g = [None] * n
+    g[n - 1] = {s: (0, -(1 if s == BOTTOM else 0)) for s in allowed[n - 1]}
+    for i in range(n - 2, -1, -1):
+        cur = {}
+        for s in allowed[i]:
+            best = None
+            for t, (sw, nb) in g[i + 1].items():
+                cand = (sw + (1 if t != s else 0), nb)
+                if best is None or cand < best:
+                    best = cand
+            cur[s] = (best[0], best[1] - (1 if s == BOTTOM else 0))
+        g[i] = cur
+
+    # 自左向右贪心重建：每位先试下方，恰与最优总代价一致即选定，
+    # 所得序列在 (换位次数, 下方条数) 并列的方案中按位置下方优先。
+    total = min(g[0].values())
+    placement = []
+    acc_sw = acc_nb = 0  # 已确定位置的换位次数、下方条数取负
+    prev = None
+    for i in range(n):
+        for s in (BOTTOM, TOP):
+            if s not in allowed[i]:
+                continue
+            trans = 1 if (prev is not None and s != prev) else 0
+            if (acc_sw + trans + g[i][s][0], acc_nb + g[i][s][1]) == total:
+                acc_sw += trans
+                acc_nb -= 1 if s == BOTTOM else 0
+                placement.append({
+                    "side": "bottom" if s == BOTTOM else "top",
+                    "allow_top": allow_top[i],
+                    "allow_bottom": allow_bottom[i],
+                    "switches": acc_sw,
+                })
+                prev = s
+                break
+    return placement, []
+
+
+def _position_prepare(req: "PositionRequest"):
+    """遮挡避让公共预处理：解析 SRT、校验轨道与遮挡区间，失败抛 400。"""
+    try:
+        entries = parse_srt(req.srt)
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        occlusions = validate_occlusions(req.intervals)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, occlusions
+
+
+def _conflict_message(conflicts: List[dict]) -> str:
+    """把冲突列表格式化为逐行中文说明（用于导出拒绝时的报错）。"""
+    side_cn = {"top": "上方", "bottom": "下方"}
+    lines = []
+    for c in conflicts:
+        ivs = "、".join(
+            f"#{iv['row']} {side_cn[iv['side']]}（{iv['start']} – {iv['end']}）"
+            for iv in c["intervals"]
+        )
+        lines.append(
+            f"第 {c['seq']} 条（原序号 {c['index']}，{c['time']}）"
+            f"两侧均被遮挡，冲突区间：{ivs}"
+        )
+    return "\n".join(lines)
+
+
+@app.post("/api/position/preview")
+def position_preview(req: PositionRequest):
+    entries, occlusions = _position_prepare(req)
+    placement, conflicts = plan_positions(entries, occlusions)
+    if conflicts:
+        return {
+            "feasible": False,
+            "entry_count": len(entries),
+            "interval_count": len(occlusions),
+            "conflicts": conflicts,
+        }
+    return {
+        "feasible": True,
+        "entry_count": len(entries),
+        "interval_count": len(occlusions),
+        "switch_count": placement[-1]["switches"],
+        "bottom_count": sum(1 for p in placement if p["side"] == "bottom"),
+        "entries": [
+            {
+                "seq": i + 1,
+                "index": e["index"],
+                "time": f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}",
+                "allow_top": p["allow_top"],
+                "allow_bottom": p["allow_bottom"],
+                "side": p["side"],
+                "switches": p["switches"],
+                "text": "\n".join(e["lines"]),
+            }
+            for i, (e, p) in enumerate(zip(entries, placement))
+        ],
+        "conflicts": [],
+    }
+
+
+@app.post("/api/position/export")
+def position_export(req: PositionRequest):
+    entries, occlusions = _position_prepare(req)
+    placement, conflicts = plan_positions(entries, occlusions)
+    if conflicts:
+        raise HTTPException(
+            status_code=400,
+            detail="存在两侧均被遮挡的字幕，已禁止下载：\n" + _conflict_message(conflicts),
+        )
+    cues = []
+    for i, (e, p) in enumerate(zip(entries, placement), 1):
+        line = "10%" if p["side"] == "top" else "90%"
+        cues.append(
+            f"{i}\n{fmt_time_vtt(e['start'])} --> {fmt_time_vtt(e['end'])} line:{line}\n"
+            + "\n".join(e["lines"])
+        )
+    content = "WEBVTT\n\n" + "\n\n".join(cues) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="text/vtt",
+        headers={"Content-Disposition": 'attachment; filename="positioned.vtt"'},
     )
