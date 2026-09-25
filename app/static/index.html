@@ -83,6 +83,19 @@
   tr.diff-row-add       td { background: #f0fdf4; }
   .diff-meta { color: #6b7280; font-size: 12px; }
   .diff-changed-note { font-size: 12px; color: #b45309; margin-left: 6px; }
+  /* ---- 字幕遮挡避让 ---- */
+  .occ-row select { font-size: 13px; padding: 5px 8px; border: 1px solid #ccc;
+           border-radius: 6px; width: 92px; }
+  .side-tag { display: inline-block; border-radius: 4px; padding: 2px 8px; font-size: 12px;
+          font-weight: 600; white-space: nowrap; }
+  .side-tag.top { background: #ede9fe; color: #6d28d9; }
+  .side-tag.bottom { background: #dbeafe; color: #1d4ed8; }
+  .side-tag.unavailable { background: #f3f4f6; color: #9ca3af; text-decoration: line-through; }
+  .side-tag.selected { outline: 2px solid #2563eb; outline-offset: 1px; }
+  .switch-tag { display: inline-block; background: #fef3c7; color: #92400e; border-radius: 4px;
+          padding: 1px 6px; font-size: 12px; }
+  tr.pos-conflict td { background: #fef2f2; }
+  .occ-side-label { font-size: 12px; color: #6b7280; }
 </style>
 </head>
 <body>
@@ -284,6 +297,35 @@
   </div>
   <div id="wmMessage"></div>
   <div id="wmResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="position">字幕遮挡避让</h1>
+<p class="hint">粘贴 SRT 并填写若干<strong>遮挡区间</strong>（起止时刻 <code>HH:MM:SS,mmm</code> 与遮挡一侧：上方 / 下方）。
+字幕与遮挡区间按<strong>左闭右开</strong>求<strong>正时长交叠</strong>（端点相触不算），<strong>交叠的一侧不可放置</strong>；
+同侧区间允许重叠，每个区间起点须早于终点。对起止有效、按时间排列且互不重叠的字幕，逐条选上方或下方，动态规划依次
+<strong>最小化相邻字幕换位次数</strong>、<strong>最大化位于下方的条数</strong>，仍并列时按<strong>下方优先的位置序列</strong>取舍。
+某条字幕两侧均被遮挡时会指出其原序号与冲突区间并禁止下载。预览显示每条可选侧、选定侧与累计换位数；
+导出的 <strong>WebVTT</strong> 保留正文与时间，以 <code>line:10%</code> / <code>line:90%</code> 标示上方 / 下方。</p>
+
+<div class="card">
+  <h2>14. SRT 与遮挡区间</h2>
+  <input type="file" id="posFile" accept=".srt,.txt">
+  <textarea id="posSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;第二句字幕"></textarea>
+  <h3 style="font-size:14px;margin:12px 0 6px">遮挡区间（至少 1 个，同侧可重叠）</h3>
+  <div id="posIntervals"></div>
+  <button class="secondary" onclick="addOcclude()">+ 添加遮挡区间</button>
+</div>
+
+<div class="card">
+  <h2>15. 预览位置与下载 WebVTT</h2>
+  <div class="toolbar">
+    <button onclick="posPreview()">预览字幕位置</button>
+    <button id="posExportBtn" onclick="posExport()" disabled>下载 WebVTT</button>
+    <span class="hint" id="posExportHint">请先预览，校验通过且无两侧皆遮挡字幕时才能下载</span>
+  </div>
+  <div id="posMessage"></div>
+  <div id="posResult"></div>
 </div>
 
 <script>
@@ -977,6 +1019,167 @@ async function wmExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "word_mark_intervals.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 字幕遮挡避让
+
+bindTrackFile("posFile", "posSrt");
+
+const POS_SIDE_CN = { top: "上方", bottom: "下方" };
+
+function addOcclude(start = "", end = "", side = "top") {
+  const div = document.createElement("div");
+  div.className = "interval-row";
+  div.innerHTML =
+    `<span class="row-no"></span>` +
+    `<input type="text" class="oc-start" placeholder="起点 00:01:00,000" value="${start}">` +
+    `<span class="hint">→</span><input type="text" class="oc-end" placeholder="终点 00:02:00,000" value="${end}">` +
+    `<select class="oc-side" title="遮挡一侧">` +
+      `<option value="top"${side === "top" ? " selected" : ""}>上方遮挡</option>` +
+      `<option value="bottom"${side === "bottom" ? " selected" : ""}>下方遮挡</option>` +
+    `</select>` +
+    `<button class="danger" onclick="this.parentElement.remove(); numberOccludes();">删除</button>`;
+  $("posIntervals").appendChild(div);
+  numberOccludes();
+}
+addOcclude();
+
+function occludeRows() {
+  // 起止全空的行不参与提交，与其他功能的区间行过滤规则一致
+  return [...document.querySelectorAll("#posIntervals .interval-row")]
+    .filter(row => {
+      const s = row.querySelector(".oc-start").value.trim();
+      const e = row.querySelector(".oc-end").value.trim();
+      return s || e;
+    });
+}
+
+function numberOccludes() {
+  occludeRows().forEach((row, i) => { row.querySelector(".row-no").textContent = `#${i + 1}`; });
+}
+
+$("posIntervals").addEventListener("input", () => numberOccludes());
+
+function collectOccludes() {
+  return occludeRows().map(row => ({
+    start: row.querySelector(".oc-start").value.trim(),
+    end: row.querySelector(".oc-end").value.trim(),
+    side: row.querySelector(".oc-side").value,
+  }));
+}
+
+function posPayload() {
+  return JSON.stringify({ srt: $("posSrt").value, intervals: collectOccludes() });
+}
+
+function showPosError(msg) {
+  $("posMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("posResult").innerHTML = "";
+  $("posExportBtn").disabled = true;
+}
+
+function posErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function occludeListHtml(list) {
+  if (!list.length) return '<span class="hint">无</span>';
+  return list.map(iv =>
+    `<span class="mono hint">#${iv.row} ${escapeHtml(iv.start)} → ${escapeHtml(iv.end)}</span>`
+  ).join("<br>");
+}
+
+function sideTagsHtml(available, selected) {
+  return ["top", "bottom"].map(s => {
+    const cls = available[s]
+      ? `side-tag ${s}${selected === s ? " selected" : ""}`
+      : `side-tag unavailable ${s}`;
+    return `<span class="${cls}">${POS_SIDE_CN[s]}${available[s] ? "可选" : "遮挡"}</span>`;
+  }).join(" ");
+}
+
+function renderPosConflict(c) {
+  return `
+    <tr class="pos-conflict">
+      <td>${c.seq}</td>
+      <td>${escapeHtml(c.index)}</td>
+      <td class="mono">${escapeHtml(c.time)}</td>
+      <td class="mono">${escapeHtml(c.text)}</td>
+      <td>${occludeListHtml(c.top)}</td>
+      <td>${occludeListHtml(c.bottom)}</td>
+    </tr>`;
+}
+
+function renderPosPreview(pv) {
+  if (!pv.feasible) {
+    const rows = pv.conflicts.map(renderPosConflict).join("");
+    $("posResult").innerHTML = `<table>
+      <tr><th style="width:3em">顺序</th><th style="width:4em">原序号</th><th>时间</th><th>正文</th><th>上方冲突区间</th><th>下方冲突区间</th></tr>
+      ${rows}</table>`;
+    const names = pv.conflicts.map(c => `第 ${c.seq} 条（原序号 ${escapeHtml(c.index)}）`).join("、");
+    $("posMessage").innerHTML =
+      `<div class="error">✗ ${names} 的上、下两侧均与遮挡区间有正时长交叠，无法放置字幕；` +
+      `共 ${pv.conflict_count} 条冲突，已禁止下载 WebVTT。请调整遮挡区间或字幕时间后重试。</div>`;
+    $("posExportBtn").disabled = true;
+    return;
+  }
+
+  const entryRows = pv.entries.map(e => `
+    <tr>
+      <td>${e.seq}</td>
+      <td>${escapeHtml(e.index)}</td>
+      <td class="mono">${escapeHtml(e.time)}</td>
+      <td class="mono">${escapeHtml(e.text)}</td>
+      <td>${sideTagsHtml(e.available, e.side)}</td>
+      <td><strong>${POS_SIDE_CN[e.side]}</strong>
+        <span class="side-tag ${e.side}">line:${e.side === "top" ? "10%" : "90%"}</span></td>
+      <td>${e.switches}${e.seq > 1 && e.switches !== pv.entries[e.seq - 2].switches
+          ? ' <span class="switch-tag">换位</span>' : ""}</td>
+    </tr>`).join("");
+  $("posResult").innerHTML = `<table>
+    <tr><th style="width:3em">顺序</th><th style="width:4em">原序号</th><th>时间</th><th>正文</th>
+    <th style="width:13em">可选侧（不可放侧标遮挡）</th><th style="width:11em">选定侧</th><th style="width:7em">累计换位数</th></tr>
+    ${entryRows}</table>`;
+  $("posMessage").innerHTML =
+    `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 遮挡区间 ${pv.interval_count} 个；` +
+    `最优方案：相邻换位 <strong>${pv.switch_count}</strong> 次，位于下方 ${pv.bottom_count} 条、` +
+    `上方 ${pv.top_count} 条，可以下载 WebVTT。</div>`;
+  $("posExportBtn").disabled = false;
+}
+
+async function posPreview() {
+  $("posMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/position/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: posPayload(),
+    });
+  } catch (e) { return showPosError("网络错误：" + e); }
+  const data = await res.json();
+  if (!res.ok) return showPosError(posErrDetail(data));
+  renderPosPreview(data);
+}
+
+async function posExport() {
+  let res;
+  try {
+    res = await fetch("/api/position/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: posPayload(),
+    });
+  } catch (e) { return showPosError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showPosError(posErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "positioned.vtt";
   a.click();
   URL.revokeObjectURL(a.href);
 }
